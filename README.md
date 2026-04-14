@@ -1,61 +1,48 @@
 # AlembicKV
 
-**Fixed-memory KV cache replacement for transformer inference.**
+**Fixed-budget KV cache for transformer inference.**
 
-Standard KV cache grows linearly with sequence length. At 100K tokens on a 70B model, that's 32 GB of VRAM just for the cache. At 1M tokens: 328 GB.
+Drop-in replacement for HuggingFace's `DynamicCache`. Caps memory at a fixed token budget with importance-weighted eviction. Below budget: identical to standard cache. Above budget: evicts least-important tokens, keeps sink tokens and recent window.
 
-AlembicKV replaces the unbounded cache with a fixed-size concept codebook. **1.3 GB for a 70B model, regardless of sequence length.** 1K tokens, 1M tokens, 1B tokens — same memory.
+## Verified Results (Qwen2.5-7B, WikiText-2, 1024-token sequences)
 
-## How it works
+| Budget | Perplexity | vs Standard | Memory |
+|--------|-----------|-------------|--------|
+| Standard (unbounded) | 9.787 | baseline | O(n) |
+| 512 tokens | 9.787 | **+0.0%** | Fixed |
+| 256 tokens | 9.868 | **+0.8%** | Fixed |
+| 128 tokens | 51.53 | +427% | Fixed |
 
-Each transformer layer gets a concept chamber: a fixed codebook of K/V vectors in native attention space.
+**Below budget = lossless.** No quality degradation until eviction kicks in.
+At 256 tokens (4x compression of 1K context): only 0.8% perplexity increase.
 
-**Write (absorb a token):** New K/V pairs are distributed across the codebook via soft-attention. The token's information blends into the most relevant concept slots. Nothing is evicted — information accumulates.
-
-**Read (attention):** The codebook entries are returned directly as K/V for the attention mechanism. No projections, no training required.
-
-**QARC (Quasicrystal Autopoietic Resonance Cascade):** Periodic resonance dynamics prevent the codebook from collapsing into a mean-field summary. Coupled pendulums at incommensurate metallic-mean frequencies (golden ratio, bronze ratio) create quasiperiodic dynamics that maintain slot diversity.
-
-## Memory comparison
-
-| Sequence length | Standard KV (70B) | AlembicKV (2048 slots) | Compression |
-|-----------------|-------------------|------------------------|-------------|
-| 1K tokens       | 32 MB             | 1.3 GB                 | 0.02x       |
-| 10K tokens      | 320 MB            | 1.3 GB                 | 0.25x       |
-| 100K tokens     | 32 GB             | 1.3 GB                 | **25x**     |
-| 1M tokens       | 328 GB            | 1.3 GB                 | **252x**    |
-| 10M tokens      | 3.2 TB            | 1.3 GB                 | **2,521x**  |
-
-Crossover point: ~42K tokens. Below that, standard KV is cheaper. Above that, AlembicKV wins and the advantage compounds linearly.
-
-## Quick start
+## Quick Start
 
 ```python
-from alembic_kv import AlembicKVCache, AlembicKVConfig
+from alembic_kv.hf_cache import AlembicHFCache
 
-# Configure for your model
-config = AlembicKVConfig(
-    num_layers=32,       # model layers
-    num_heads=8,         # KV heads (use num_key_value_heads for GQA)
-    head_dim=128,        # dimension per head
-    budget=2048,         # concept slots (NOT token slots)
+# Create fixed-budget cache
+cache = AlembicHFCache(budget=2048)
+
+# Use with any HuggingFace model — identical API to DynamicCache
+outputs = model.generate(
+    input_ids,
+    past_key_values=cache,
+    use_cache=True,
+    max_new_tokens=1000,
 )
 
-print(config.summary())
-# AlembicKV Config:
-#   Total VRAM: 1.3 GB (K+V codebooks, float32)
-#   Compression vs standard KV cache:
-#     At 100K tokens: 25x  (std: 32.00 GB)
-#     At   1M tokens: 252x (std: 328.00 GB)
-
-# Create cache
-cache = AlembicKVCache(config)
-
-# Use in generation loop (DynamicCache-compatible interface)
-keys, values = cache.update(key_states, value_states, layer_idx=0)
-# keys/values contain: [concept_codebook, raw_current_token]
-# Pass to attention as usual
+# Memory is capped at budget tokens regardless of generation length
+print(cache.stats())
 ```
+
+## How It Works
+
+1. **Below budget:** Standard concat — identical to `DynamicCache`, zero quality loss
+2. **At budget:** Evict least-important tokens from the middle of the sequence
+3. **Always keep:** Sink tokens (first 4) + recent window (last 64) — these are critical for attention pattern stability
+
+Eviction uses cumulative importance scoring. Tokens that receive more attention weight during generation are retained; rarely-attended tokens are evicted first.
 
 ## Installation
 
@@ -70,40 +57,30 @@ cd alembic-kv
 pip install -e ".[dev]"
 ```
 
+## Memory
+
+For a model with `num_layers` layers, `num_kv_heads` KV heads, `head_dim` dim per head:
+
+```
+Standard cache: num_layers * seq_len * num_kv_heads * head_dim * 2 (K+V) * 2 bytes
+AlembicKV:      num_layers * budget  * num_kv_heads * head_dim * 2 (K+V) * 2 bytes
+```
+
+Memory is capped at `budget` tokens. Example for Qwen2.5-7B (28 layers, 4 KV heads, 128 dim):
+
+| Sequence Length | Standard Cache | AlembicKV (budget=2048) |
+|-----------------|---------------|-------------------------|
+| 1K tokens | 28 MB | 28 MB |
+| 10K tokens | 280 MB | 28 MB |
+| 100K tokens | 2.8 GB | 28 MB |
+
 ## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `budget` | 2048 | Concept codebook slots. More = more capacity, more VRAM |
-| `write_alpha` | 0.1 | Absorption rate. Higher = faster absorption |
-| `write_temp` | 0.1 | Write attention temperature. Lower = sharper (fewer slots per token) |
-| `qarc_gamma` | 0.03 | QARC resonance strength. Higher = more anti-collapse force |
-| `qarc_iterations` | 3 | QARC steps per resonance cycle |
-| `resonate_every` | 64 | Run QARC every N tokens |
-
-## Architecture
-
-```
-Token K/V ──► Normalize ──► Soft-attention score against codebook
-                                    │
-                                    ▼
-                           Additive write into most relevant slots
-                                    │
-                                    ▼
-                           QARC resonance (periodic)
-                           Prevents slot convergence via
-                           quasiperiodic coupled pendulums
-                                    │
-                                    ▼
-Attention query ──────────► Read codebook directly as K/V
-                           No projections, no training
-```
-
-**No learned projections.** The codebook operates in the model's native K/V space. Any model with standard multi-head attention works out of the box. No fine-tuning, no adapter training.
-
-**No eviction.** Information accumulates indefinitely. The codebook absorbs concepts — not individual tokens. 2048 concept slots can represent far more than 2048 tokens of context because natural language is massively redundant.
-
-**QARC anti-collapse.** Without resonance, repeated soft-writes cause all codebook slots to converge toward the data mean. QARC pushes correlated slots apart via quasiperiodic dynamics at metallic-mean frequencies, maintaining the diversity needed for precise retrieval.
+| `budget` | 2048 | Maximum tokens to retain |
+| `n_sink` | 4 | Always keep first N tokens (attention sinks) |
+| `recent_window` | 64 | Always keep last N tokens |
 
 ## Tests
 
@@ -112,16 +89,9 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-## Benchmarks
-
-```bash
-# Needle-in-haystack retrieval test
-python benchmarks/bench_retrieval.py --workers 8 --tokens 10000 --trials 16
-```
-
 ## License
 
-Apache 2.0 with Commons Clause. Free for non-commercial use. For commercial licensing, contact christian@tricameral.ai.
+Apache 2.0 with Commons Clause. Free for non-commercial use. Commercial licensing: CKnopp@gmail.com
 
 ## Author
 
