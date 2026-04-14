@@ -148,10 +148,18 @@ class AlembicLayer(CacheLayerMixin):
 
     def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
         if not self._compressed:
-            kv_length = (self._keys.shape[2] if self._keys is not None else 0) + query_length
+            current = self._keys.shape[2] if self._keys is not None else 0
+            post_update = current + query_length
+            # Will compression trigger?
+            if post_update >= self.budget + self.window_size:
+                # After compression: codebook + window + any overflow as raw
+                kv_length = self.budget + self.window_size
+            else:
+                kv_length = post_update
         else:
             recent_len = self._recent_k.shape[2] if self._recent_k is not None else 0
-            kv_length = self.budget + recent_len + query_length
+            # After update: codebook stays fixed, window slides, +query raw
+            kv_length = self.budget + min(recent_len + query_length, self.window_size)
         kv_offset = 0
         return kv_length, kv_offset
 
@@ -177,9 +185,7 @@ class AlembicLayer(CacheLayerMixin):
             # Compress when we have enough for codebook + window
             if total >= self.budget + self.window_size:
                 self._compress()
-                # Return the full hybrid buffer
                 all_k, all_v = self._build_full_kv()
-                # Add current token if it wasn't included in recent window
                 return all_k, all_v
 
             return self._keys, self._values
@@ -187,28 +193,22 @@ class AlembicLayer(CacheLayerMixin):
         else:
             # ── Hybrid phase: absorb old into codebook, slide window ──
 
-            # Current recent window tokens that are about to become "old"
-            # Push new tokens into recent window, oldest recent → codebook
+            # Append new tokens to recent window
             if self._recent_k is not None and self._recent_k.shape[2] > 0:
-                # Tokens to absorb: oldest from recent window to make room
-                n_to_absorb = min(T, self._recent_k.shape[2])
-                if n_to_absorb > 0:
-                    old_k = self._recent_k[:, :, :n_to_absorb, :]
-                    old_v = self._recent_v[:, :, :n_to_absorb, :]
-                    self._absorb(old_k, old_v)
-
-                    # Slide recent window: drop oldest, append new
-                    self._recent_k = torch.cat([
-                        self._recent_k[:, :, n_to_absorb:, :],
-                        key_states
-                    ], dim=2)[:, :, -self.window_size:, :]
-                    self._recent_v = torch.cat([
-                        self._recent_v[:, :, n_to_absorb:, :],
-                        value_states
-                    ], dim=2)[:, :, -self.window_size:, :]
+                self._recent_k = torch.cat([self._recent_k, key_states], dim=2)
+                self._recent_v = torch.cat([self._recent_v, value_states], dim=2)
             else:
                 self._recent_k = key_states
                 self._recent_v = value_states
+
+            # If window exceeds size, absorb overflow into codebook
+            if self._recent_k.shape[2] > self.window_size:
+                overflow = self._recent_k.shape[2] - self.window_size
+                old_k = self._recent_k[:, :, :overflow, :]
+                old_v = self._recent_v[:, :, :overflow, :]
+                self._absorb(old_k, old_v)
+                self._recent_k = self._recent_k[:, :, overflow:, :]
+                self._recent_v = self._recent_v[:, :, overflow:, :]
 
             # Periodic QARC resonance
             self._absorb_count += 1
