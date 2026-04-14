@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alembic-kv"
+version = "0.1.0"
+description = "Fixed-memory KV cache replacement using antiresonant concept chambers"
+readme = "README.md"
+license = {text = "Apache-2.0 WITH Commons Clause"}
+requires-python = ">=3.10"
+authors = [{name = "Christian Knopp"}]
+keywords = ["transformer", "kv-cache", "attention", "memory", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+transformers = ["transformers>=4.40", "accelerate>=0.27"]
+dev = ["pytest>=7.0", "pytest-cov", "pytest-benchmark"]
+
+[project.urls]
+Homepage = "https://github.com/zynerji/alembic-kv"
+Repository = "https://github.com/zynerji/alembic-kv"
+
+[tool.setuptools.packages.find]
+include = ["alembic_kv*"]
