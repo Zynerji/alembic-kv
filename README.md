@@ -50,16 +50,19 @@ Standard KV cache exhausts 38 GB of free VRAM at ~25K tokens. AlembicKV stays fl
 
 Standard cache would need **~860 GB** at 1M tokens. AlembicKV: **4.5 GB**. That's **~192x compression**.
 
-## Verified Perplexity (Qwen2.5-7B, WikiText-2)
+## Verified Perplexity (Qwen2.5-7B, chunked forward passes)
 
-| Budget (codebook+window) | Perplexity | vs Standard |
-|---------------------------|-----------|-------------|
-| Standard (unbounded) | 9.787 | baseline |
-| 512 (lossless) | 9.787 | **+0.0%** |
-| 256 (lossless) | 9.668 | **-1.2%** |
-| 128+128 (hybrid active) | 10.17 | **+3.9%** |
+| Context | Budget+Window | Standard PPL | AlembicKV PPL | Delta | Mode |
+|---------|---------------|-------------|---------------|-------|------|
+| 256 | 128+128 | 2.05 | 2.05 | **+0.0%** | fill (lossless) |
+| 512 | 128+128 | 1.52 | 10.25 | **+573%** | codebook active |
+| 256-8192 | 2048+512 | 1.12-2.05 | 1.12-2.05 | **+0.0%** | fill (lossless) |
 
-At 4x compression (128 codebook + 128 window for 1K token sequences): only 3.9% perplexity increase.
+**Below budget+window: perfectly lossless.** Zero perplexity difference at any context length.
+
+**Above budget+window: significant quality cost.** When the codebook absorbs tokens, perplexity increases substantially. The soft-attention write mechanism compresses K/V information lossily. This is the active area of improvement.
+
+**The tradeoff:** AlembicKV trades quality for unlimited context. Standard cache is better when it fits in VRAM. AlembicKV enables contexts that standard cache cannot serve at all (50K+ on 31B, 500K+ on 7B).
 
 ## How It Works
 

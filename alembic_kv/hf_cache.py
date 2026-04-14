@@ -65,6 +65,7 @@ class AlembicLayer(CacheLayerMixin):
 
         self._is_initialized = False
         self._compressed = False
+        self._needs_compress = False
         self._seq_length = 0
         self._absorb_count = 0
         self.num_heads = 0
@@ -187,18 +188,12 @@ class AlembicLayer(CacheLayerMixin):
         return None
 
     def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
-        if not self._compressed:
-            current = self._keys.shape[2] if self._keys is not None else 0
-            post_update = current + query_length
-            # Will compression trigger?
-            if post_update >= self.budget + self.window_size:
-                # After compression: codebook + window + any overflow as raw
-                kv_length = self.budget + self.window_size
-            else:
-                kv_length = post_update
-        else:
+        if self._needs_compress and not self._compressed:
+            # Next update: compress → absorb new into window
+            # Returns codebook + window (new tokens slide into window)
+            kv_length = self.budget + self.window_size
+        elif not self._compressed:
             recent_len = self._recent_k.shape[2] if self._recent_k is not None else 0
-            # After update: codebook stays fixed, window slides, +query raw
             kv_length = self.budget + min(recent_len + query_length, self.window_size)
         kv_offset = 0
         return kv_length, kv_offset
@@ -211,6 +206,12 @@ class AlembicLayer(CacheLayerMixin):
         B, H, T, D = key_states.shape
         self.tokens_absorbed += T
 
+        # Deferred compression from previous large prefill
+        if self._needs_compress and not self._compressed:
+            self._compress()
+            self._needs_compress = False
+            # Now in compressed mode — fall through to absorb phase
+
         if not self._compressed:
             # ── Fill phase: standard concat ───────────────────────
             if self._keys is None:
@@ -222,11 +223,20 @@ class AlembicLayer(CacheLayerMixin):
 
             total = self._keys.shape[2]
 
-            # Compress when we have enough for codebook + window
+            # Compress when we have enough — but only if this isn't the
+            # initial prefill (where the mask was sized for full concat).
+            # Defer compression if we just received a large chunk.
             if total >= self.budget + self.window_size:
-                self._compress()
-                all_k, all_v = self._build_full_kv()
-                return all_k, all_v
+                if total == key_states.shape[2]:
+                    # First call with a big prefill — return full concat now,
+                    # compress on the NEXT update call
+                    self._needs_compress = True
+                    return self._keys, self._values
+                else:
+                    # Accumulated past budget — compress now
+                    self._compress()
+                    all_k, all_v = self._build_full_kv()
+                    return all_k, all_v
 
             return self._keys, self._values
 
@@ -339,8 +349,11 @@ class AlembicLayer(CacheLayerMixin):
         self._values = None
         self._codebook_k = None
         self._codebook_v = None
+        self._ternary_k = None
+        self._ternary_v = None
         self._recent_k = None
         self._recent_v = None
+        self._needs_compress = False
         self._is_initialized = False
         self._compressed = False
         self._seq_length = 0
