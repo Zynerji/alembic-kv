@@ -40,21 +40,26 @@ class AlembicLayer(CacheLayerMixin):
 
     def __init__(self, budget: int = 2048, window_size: int = 128,
                  write_alpha: float = 0.1, write_temp: float = 0.1,
-                 qarc_gamma: float = 0.01, resonate_every: int = 64):
+                 qarc_gamma: float = 0.01, resonate_every: int = 64,
+                 ternary: bool = False, ternary_sparsity: float = 0.5):
         self.budget = budget           # codebook concept slots
         self.window_size = window_size # exact recent tokens to keep
         self.write_alpha = write_alpha
         self.write_temp = write_temp
         self.qarc_gamma = qarc_gamma
         self.resonate_every = resonate_every
+        self.use_ternary = ternary
+        self.ternary_sparsity = ternary_sparsity
 
         # Fill phase: standard concat
         self._keys = None      # (B, H, T, D)
         self._values = None
 
         # Codebook phase
-        self._codebook_k = None  # (budget, H*D) float32
+        self._codebook_k = None  # (budget, H*D) float32 or TernaryCodebook
         self._codebook_v = None
+        self._ternary_k = None   # TernaryCodebook when ternary=True
+        self._ternary_v = None
         self._recent_k = None    # (B, H, window_size, D) raw recent tokens
         self._recent_v = None
 
@@ -100,7 +105,9 @@ class AlembicLayer(CacheLayerMixin):
         if self._keys is not None:
             return self._keys
         if self._compressed:
-            return self._build_full_kv()[0]
+            float_k = self._get_codebook_float('k')
+            if float_k is not None:
+                return self._codebook_to_kv(float_k)
         return torch.empty(0)
 
     @property
@@ -108,19 +115,52 @@ class AlembicLayer(CacheLayerMixin):
         if self._values is not None:
             return self._values
         if self._compressed:
-            return self._build_full_kv()[1]
+            float_v = self._get_codebook_float('v')
+            if float_v is not None:
+                return self._codebook_to_kv(float_v)
         return torch.empty(0)
 
     def _codebook_to_kv(self, codebook):
         """(budget, H*D) -> (1, H, budget, D)"""
+        if codebook is None:
+            return torch.empty(0)
         cb = codebook.reshape(self.budget, self.num_heads, self.head_dim)
         return cb.permute(1, 0, 2).unsqueeze(0).to(self.dtype)
+
+    def _get_codebook_float(self, which='k'):
+        """Get codebook as float32 tensor, dequantizing ternary if needed."""
+        if self.use_ternary:
+            tcb = self._ternary_k if which == 'k' else self._ternary_v
+            return tcb.dequantize_batch() if tcb is not None else None
+        return self._codebook_k if which == 'k' else self._codebook_v
+
+    def _set_codebook(self, k_float: torch.Tensor, v_float: torch.Tensor):
+        """Store codebook, quantizing to ternary if enabled."""
+        if self.use_ternary:
+            from .ternary import TernaryCodebook
+            if self._ternary_k is None:
+                self._ternary_k = TernaryCodebook(
+                    self.budget, self.kv_dim,
+                    sparsity=self.ternary_sparsity, device=k_float.device)
+                self._ternary_v = TernaryCodebook(
+                    self.budget, self.kv_dim,
+                    sparsity=self.ternary_sparsity, device=v_float.device)
+            self._ternary_k.quantize_from(k_float)
+            self._ternary_v.quantize_from(v_float)
+            # Keep float refs as None to save memory
+            self._codebook_k = None
+            self._codebook_v = None
+        else:
+            self._codebook_k = k_float
+            self._codebook_v = v_float
 
     def _build_full_kv(self):
         """Build [codebook | recent] K/V tensors."""
         B = self._recent_k.shape[0] if self._recent_k is not None else 1
-        cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
-        cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
+        float_k = self._get_codebook_float('k')
+        float_v = self._get_codebook_float('v')
+        cb_k = self._codebook_to_kv(float_k).expand(B, -1, -1, -1)
+        cb_v = self._codebook_to_kv(float_v).expand(B, -1, -1, -1)
         if self._recent_k is not None and self._recent_k.shape[2] > 0:
             all_k = torch.cat([cb_k, self._recent_k], dim=2)
             all_v = torch.cat([cb_v, self._recent_v], dim=2)
@@ -230,8 +270,9 @@ class AlembicLayer(CacheLayerMixin):
         # Codebook = first budget tokens (compressed representation)
         old_k = self._keys[:, :, :self.budget, :]
         old_v = self._values[:, :, :self.budget, :]
-        self._codebook_k = old_k[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
-        self._codebook_v = old_v[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        k_float = old_k[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        v_float = old_v[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        self._set_codebook(k_float, v_float)
 
         # If there are tokens between budget and window, absorb them
         middle_start = self.budget
@@ -247,36 +288,51 @@ class AlembicLayer(CacheLayerMixin):
         self._compressed = True
 
     def _absorb(self, keys: torch.Tensor, values: torch.Tensor):
-        """Absorb K/V into concept codebook via soft-attention write."""
+        """Absorb K/V into concept codebook via soft-attention write.
+
+        For ternary mode: dequantize → absorb in float32 → re-quantize.
+        """
         B, H, T, D = keys.shape
         k_flat = keys.transpose(1, 2).reshape(B * T, H * D).float()
         v_flat = values.transpose(1, 2).reshape(B * T, H * D).float()
 
+        # Get current codebook as float32
+        cb_k = self._get_codebook_float('k')
+        cb_v = self._get_codebook_float('v')
+
         k_norm = F.normalize(k_flat, dim=-1)
-        cb_norm = F.normalize(self._codebook_k, dim=-1)
+        cb_norm = F.normalize(cb_k, dim=-1)
         scores = torch.matmul(k_norm, cb_norm.T) / self.write_temp
         attn = F.softmax(scores, dim=-1)
 
         k_update = torch.matmul(attn.T, k_flat) / max(B * T, 1)
         v_update = torch.matmul(attn.T, v_flat) / max(B * T, 1)
-        self._codebook_k.add_(self.write_alpha * k_update)
-        self._codebook_v.add_(self.write_alpha * v_update)
+        cb_k = cb_k + self.write_alpha * k_update
+        cb_v = cb_v + self.write_alpha * v_update
+
+        # Store back (quantizes to ternary if enabled)
+        self._set_codebook(cb_k, cb_v)
 
     def _resonate(self):
         """QARC: push correlated codebook slots apart."""
-        if self._codebook_k is None or self.qarc_gamma <= 0:
+        if self.qarc_gamma <= 0:
             return
-        cb_norm = F.normalize(self._codebook_k, dim=-1)
+        cb_k = self._get_codebook_float('k')
+        cb_v = self._get_codebook_float('v')
+        if cb_k is None:
+            return
+
+        cb_norm = F.normalize(cb_k, dim=-1)
         sim = torch.matmul(cb_norm, cb_norm.T)
         sim.fill_diagonal_(0.0)
-        repulsion = torch.matmul(sim, self._codebook_k)
-        self._codebook_k.sub_(self.qarc_gamma * repulsion)
+        cb_k = cb_k - self.qarc_gamma * torch.matmul(sim, cb_k)
 
-        cb_norm_v = F.normalize(self._codebook_v, dim=-1)
+        cb_norm_v = F.normalize(cb_v, dim=-1)
         sim_v = torch.matmul(cb_norm_v, cb_norm_v.T)
         sim_v.fill_diagonal_(0.0)
-        repulsion_v = torch.matmul(sim_v, self._codebook_v)
-        self._codebook_v.sub_(self.qarc_gamma * repulsion_v)
+        cb_v = cb_v - self.qarc_gamma * torch.matmul(sim_v, cb_v)
+
+        self._set_codebook(cb_k, cb_v)
 
     def reset(self):
         self._keys = None
@@ -335,7 +391,8 @@ class AlembicHFCache(DynamicCache):
 
     def __init__(self, budget: int = 2048, window_size: int = 128,
                  write_alpha: float = 0.1, write_temp: float = 0.1,
-                 qarc_gamma: float = 0.01, resonate_every: int = 64):
+                 qarc_gamma: float = 0.01, resonate_every: int = 64,
+                 ternary: bool = False, ternary_sparsity: float = 0.5):
         super().__init__()
         self.budget = budget
         self.window_size = window_size
@@ -343,6 +400,8 @@ class AlembicHFCache(DynamicCache):
         self.write_temp = write_temp
         self.qarc_gamma = qarc_gamma
         self.resonate_every = resonate_every
+        self.use_ternary = ternary
+        self.ternary_sparsity = ternary_sparsity
         self.layer_class_to_replicate = None
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor,
@@ -355,6 +414,8 @@ class AlembicHFCache(DynamicCache):
                 write_temp=self.write_temp,
                 qarc_gamma=self.qarc_gamma,
                 resonate_every=self.resonate_every,
+                ternary=self.use_ternary,
+                ternary_sparsity=self.ternary_sparsity,
             ))
         return self.layers[layer_idx].update(key_states, value_states, *args, **kwargs)
 

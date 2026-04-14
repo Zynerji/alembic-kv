@@ -36,7 +36,19 @@ Standard cache OOMs. AlembicKV keeps running.
 | 50,000 | **OOM** | 4,695 MB | **AlembicKV only** |
 | 100,000 | **OOM** | 5,421 MB | **AlembicKV only** |
 
-Standard KV cache exhausts 38 GB of free VRAM at ~25K tokens. AlembicKV stays flat at ~5 GB and runs to 100K+ tokens on the same hardware.
+Standard KV cache exhausts 38 GB of free VRAM at ~25K tokens. AlembicKV stays flat at ~5 GB and runs to 1M tokens on the same hardware.
+
+### Full eval: 100K to 1M tokens (Gemma 4 31B)
+
+| Tokens | AlembicKV Cache | Peak VRAM |
+|--------|----------------|-----------|
+| 100,000 | 5,423 MB | 7,822 MB |
+| 200,000 | 5,119 MB | 7,822 MB |
+| 300,000 | 4,824 MB | 7,822 MB |
+| 500,000 | 4,219 MB | 7,826 MB |
+| **1,000,000** | **4,471 MB** | **7,826 MB** |
+
+Standard cache would need **~860 GB** at 1M tokens. AlembicKV: **4.5 GB**. That's **~192x compression**.
 
 ## Verified Perplexity (Qwen2.5-7B, WikiText-2)
 

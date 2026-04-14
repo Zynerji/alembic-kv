@@ -142,7 +142,8 @@ def main():
     dtype = getattr(torch, args.dtype)
 
     # Sequence lengths to test
-    seq_lengths = [1000, 2000, 5000, 10000, 20000, 50000]
+    seq_lengths = [1000, 2000, 5000, 10000, 20000, 50000,
+                   100000, 200000, 300000, 500000, 1000000]
     seq_lengths = [s for s in seq_lengths if s <= args.max_tokens]
     if args.max_tokens not in seq_lengths:
         seq_lengths.append(args.max_tokens)
