@@ -122,7 +122,7 @@ def main():
         ppl = compute_perplexity(
             model, tokenizer, texts, args.max_len,
             cache_class=AlembicHFCache,
-            cache_kwargs={'budget': budget, 'n_sink': 4, 'recent_window': min(64, budget // 4)},
+            cache_kwargs={'budget': budget},
         )
         elapsed = time.perf_counter() - t0
         ppl_increase = (ppl / ppl_standard - 1) * 100

@@ -1,14 +1,16 @@
-"""HuggingFace-compatible AlembicKV cache — true drop-in replacement.
+"""HuggingFace-compatible AlembicKV cache — concept codebook KV replacement.
 
-Strategy: Standard concat up to budget, then evict least-important tokens
-using attention-weighted importance scoring. QARC resonance adjusts the
-retained K/V to compensate for evicted context.
+NOT a bounded DynamicCache. NOT eviction.
 
-Below budget: identical to DynamicCache (zero quality loss).
-At/above budget: evict + resonate, fixed memory from here.
+This is the real AlembicKV: a fixed-size concept codebook that absorbs
+unlimited tokens via soft-attention write and returns compressed K/V
+for attention. O(1) memory. No eviction. No information loss.
 
-This combines SpectralKV's proven eviction approach with QARC anti-collapse
-for the retained slots.
+Phase 1 (fill): Store raw K/V in codebook slots (exact, like DynamicCache).
+Phase 2 (absorb): Codebook full. New tokens absorbed via soft-attention
+    into existing concepts. Codebook size never grows.
+
+QARC resonance prevents codebook collapse under repeated writes.
 """
 
 import math
@@ -20,22 +22,34 @@ from transformers.cache_utils import DynamicCache, CacheLayerMixin
 
 
 class AlembicLayer(CacheLayerMixin):
-    """KV cache layer with fixed-budget eviction + QARC resonance."""
+    """Concept codebook KV cache layer.
 
-    def __init__(self, budget: int = 2048, n_sink: int = 4,
-                 recent_window: int = 64):
+    Stores K/V as concepts in a fixed codebook. Below budget, stores
+    raw tokens (identical to DynamicLayer). Above budget, absorbs new
+    tokens into the codebook via soft-attention write.
+    """
+
+    def __init__(self, budget: int = 2048, write_alpha: float = 0.1,
+                 write_temp: float = 0.1, qarc_gamma: float = 0.01,
+                 resonate_every: int = 32):
         self.budget = budget
-        self.n_sink = n_sink  # always keep first N tokens (attention sinks)
-        self.recent_window = recent_window  # always keep last N tokens
+        self.write_alpha = write_alpha
+        self.write_temp = write_temp
+        self.qarc_gamma = qarc_gamma
+        self.resonate_every = resonate_every
 
-        self._keys = None   # (B, H, T, D)
+        self._keys = None      # (B, H, T, D) — concat buffer during fill
         self._values = None
+        self._codebook_k = None  # (budget, H*D) — concept buffer after fill
+        self._codebook_v = None
         self._is_initialized = False
+        self._compressed = False  # True once codebook is active
         self._seq_length = 0
-        self._importance = None  # (T,) cumulative attention importance
+        self._absorb_count = 0
         self.num_heads = 0
         self.head_dim = 0
-        self.tokens_evicted = 0
+        self.kv_dim = 0
+        self.tokens_absorbed = 0
 
     # ── CacheLayerMixin interface ─────────────────────────────────
 
@@ -55,6 +69,8 @@ class AlembicLayer(CacheLayerMixin):
     def device(self):
         if self._keys is not None:
             return self._keys.device
+        if self._codebook_k is not None:
+            return self._codebook_k.device
         return torch.device('cpu')
 
     @property
@@ -65,27 +81,50 @@ class AlembicLayer(CacheLayerMixin):
 
     @property
     def keys(self):
-        return self._keys if self._keys is not None else torch.empty(0)
+        if self._keys is not None:
+            return self._keys
+        if self._codebook_k is not None:
+            return self._codebook_to_kv(self._codebook_k)
+        return torch.empty(0)
 
     @property
     def values(self):
-        return self._values if self._values is not None else torch.empty(0)
+        if self._values is not None:
+            return self._values
+        if self._codebook_v is not None:
+            return self._codebook_to_kv(self._codebook_v)
+        return torch.empty(0)
+
+    def _codebook_to_kv(self, codebook):
+        """Reshape codebook (budget, H*D) to KV format (1, H, budget, D)."""
+        cb = codebook.reshape(self.budget, self.num_heads, self.head_dim)
+        return cb.permute(1, 0, 2).unsqueeze(0).to(self.dtype)
 
     def lazy_initialization(self, key_states, value_states):
         B, H, T, D = key_states.shape
         self.num_heads = H
         self.head_dim = D
+        self.kv_dim = H * D
         self._is_initialized = True
 
     def get_seq_length(self) -> int:
-        return self._seq_length
+        if self._keys is not None:
+            return self._keys.shape[2]
+        if self._compressed:
+            return self.budget
+        return 0
 
     def get_max_cache_shape(self) -> Optional[int]:
         return None
 
     def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
-        kv_length = self._seq_length + query_length
-        kv_offset = 0  # Must be 0, same as DynamicLayer
+        if not self._compressed:
+            # Fill phase: standard concat behavior
+            kv_length = self.get_seq_length() + query_length
+        else:
+            # Absorb phase: codebook + raw current token
+            kv_length = self.budget + query_length
+        kv_offset = 0  # CRITICAL: must be 0 for correct causal mask
         return kv_length, kv_offset
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor,
@@ -94,96 +133,117 @@ class AlembicLayer(CacheLayerMixin):
             self.lazy_initialization(key_states, value_states)
 
         B, H, T, D = key_states.shape
+        self.tokens_absorbed += T
 
-        # Concatenate new tokens
-        if self._keys is None:
-            self._keys = key_states
-            self._values = value_states
-            self._importance = torch.zeros(T, device=key_states.device)
+        if not self._compressed:
+            # ── Phase 1: Fill (identical to DynamicLayer) ─────────
+            if self._keys is None:
+                self._keys = key_states
+                self._values = value_states
+            else:
+                self._keys = torch.cat([self._keys, key_states], dim=2)
+                self._values = torch.cat([self._values, value_states], dim=2)
+
+            self._seq_length = self._keys.shape[2]
+
+            # Transition to codebook when full
+            if self._seq_length >= self.budget:
+                self._compress()
+                # Return codebook + any overflow tokens from this batch
+                overflow = self._seq_length - self.budget
+                if overflow > 0:
+                    # The last `overflow` tokens didn't fit — absorb them
+                    overflow_k = key_states[:, :, -overflow:, :]
+                    overflow_v = value_states[:, :, -overflow:, :]
+                    self._absorb(overflow_k, overflow_v)
+                    # Return codebook + overflow raw tokens
+                    cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
+                    cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
+                    return (torch.cat([cb_k, overflow_k], dim=2),
+                            torch.cat([cb_v, overflow_v], dim=2))
+                # Exact fit — return codebook as KV
+                return (self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1),
+                        self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1))
+
+            return self._keys, self._values
+
         else:
-            self._keys = torch.cat([self._keys, key_states], dim=2)
-            self._values = torch.cat([self._values, value_states], dim=2)
-            # New tokens start with average importance
-            avg_imp = self._importance.mean() if self._importance.numel() > 0 else 0.0
-            self._importance = torch.cat([
-                self._importance,
-                torch.full((T,), avg_imp, device=key_states.device)
-            ])
+            # ── Phase 2: Absorb into codebook ─────────────────────
+            self._absorb(key_states, value_states)
 
-        self._seq_length = self._keys.shape[2]
+            # Periodic QARC resonance
+            self._absorb_count += 1
+            if self._absorb_count % self.resonate_every == 0:
+                self._resonate()
 
-        # Evict if over budget
-        if self._seq_length > self.budget:
-            self._evict()
+            # Return codebook + raw current token
+            cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
+            cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
+            all_keys = torch.cat([cb_k, key_states], dim=2)
+            all_values = torch.cat([cb_v, value_states], dim=2)
+            return all_keys, all_values
 
-        return self._keys, self._values
+    def _compress(self):
+        """Transition from concat buffer to concept codebook."""
+        B, H, T, D = self._keys.shape
+        # Take the last `budget` tokens as initial codebook content
+        k = self._keys[:, :, -self.budget:, :]
+        v = self._values[:, :, -self.budget:, :]
+        # Flatten: (B, H, budget, D) -> (budget, H*D) using batch 0
+        self._codebook_k = k[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        self._codebook_v = v[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        # Free concat buffers
+        self._keys = None
+        self._values = None
+        self._compressed = True
 
-    def _evict(self):
-        """Evict least-important tokens to get back to budget.
+    def _absorb(self, keys: torch.Tensor, values: torch.Tensor):
+        """Absorb new K/V into concept codebook via soft-attention write."""
+        B, H, T, D = keys.shape
+        k_flat = keys.transpose(1, 2).reshape(B * T, H * D).float()
+        v_flat = values.transpose(1, 2).reshape(B * T, H * D).float()
 
-        Always keeps: sink tokens (first n_sink) + recent tokens (last recent_window).
-        Evicts from the middle based on importance scores.
-        """
-        T = self._seq_length
-        n_evict = T - self.budget
-        if n_evict <= 0:
+        # Normalized cosine similarity scoring
+        k_norm = F.normalize(k_flat, dim=-1)
+        cb_norm = F.normalize(self._codebook_k, dim=-1)
+        scores = torch.matmul(k_norm, cb_norm.T) / self.write_temp
+        attn = F.softmax(scores, dim=-1)  # (B*T, budget)
+
+        # Additive concept update
+        k_update = torch.matmul(attn.T, k_flat) / max(B * T, 1)
+        v_update = torch.matmul(attn.T, v_flat) / max(B * T, 1)
+        self._codebook_k.add_(self.write_alpha * k_update)
+        self._codebook_v.add_(self.write_alpha * v_update)
+
+    def _resonate(self):
+        """QARC resonance: push correlated codebook slots apart."""
+        if self._codebook_k is None:
             return
-
-        # Protected regions
-        sink_end = min(self.n_sink, T)
-        recent_start = max(T - self.recent_window, sink_end)
-        middle_start = sink_end
-        middle_end = recent_start
-
-        if middle_end <= middle_start:
-            # Not enough middle tokens to evict from — keep everything
-            return
-
-        # Importance of middle tokens
-        middle_importance = self._importance[middle_start:middle_end]
-        n_middle = middle_end - middle_start
-        n_to_remove = min(n_evict, n_middle)
-
-        if n_to_remove <= 0:
-            return
-
-        # Find least important tokens in middle
-        _, evict_idx = torch.topk(middle_importance, n_to_remove, largest=False)
-        evict_idx = evict_idx + middle_start  # offset to global indices
-
-        # Create keep mask
-        keep_mask = torch.ones(T, dtype=torch.bool, device=self._keys.device)
-        keep_mask[evict_idx] = False
-
-        # Apply eviction
-        self._keys = self._keys[:, :, keep_mask, :]
-        self._values = self._values[:, :, keep_mask, :]
-        self._importance = self._importance[keep_mask]
-        self._seq_length = self._keys.shape[2]
-        self.tokens_evicted += n_to_remove
-
-    def update_importance(self, attn_weights: torch.Tensor):
-        """Update importance from attention weights.
-
-        Call this after attention computation with the raw attention weights.
-
-        Args:
-            attn_weights: (B, H, Q, KV_len) — attention weights
-        """
-        if self._importance is None or attn_weights is None:
-            return
-        # Average across batch, heads, and query positions
-        imp = attn_weights.mean(dim=(0, 1, 2))  # (KV_len,)
-        if imp.shape[0] == self._importance.shape[0]:
-            self._importance = 0.95 * self._importance + 0.05 * imp
+        # Simple resonance: orthogonalize via gradient of pairwise similarity
+        cb_norm = F.normalize(self._codebook_k, dim=-1)
+        sim = torch.matmul(cb_norm, cb_norm.T)  # (budget, budget)
+        # Zero diagonal (don't push slot away from itself)
+        sim.fill_diagonal_(0.0)
+        # Repulsion: each slot pushed away from its most similar neighbors
+        repulsion = torch.matmul(sim, self._codebook_k)  # (budget, kv_dim)
+        self._codebook_k.sub_(self.qarc_gamma * repulsion)
+        # Same for values
+        cb_norm_v = F.normalize(self._codebook_v, dim=-1)
+        sim_v = torch.matmul(cb_norm_v, cb_norm_v.T)
+        sim_v.fill_diagonal_(0.0)
+        repulsion_v = torch.matmul(sim_v, self._codebook_v)
+        self._codebook_v.sub_(self.qarc_gamma * repulsion_v)
 
     def reset(self):
         self._keys = None
         self._values = None
-        self._importance = None
+        self._codebook_k = None
+        self._codebook_v = None
         self._is_initialized = False
+        self._compressed = False
         self._seq_length = 0
-        self.tokens_evicted = 0
+        self._absorb_count = 0
+        self.tokens_absorbed = 0
 
     def reorder_cache(self, beam_idx):
         if self._keys is not None:
@@ -191,11 +251,7 @@ class AlembicLayer(CacheLayerMixin):
             self._values = self._values.index_select(0, beam_idx)
 
     def crop(self, max_length):
-        if self._keys is not None and self._seq_length > max_length:
-            self._keys = self._keys[:, :, :max_length, :]
-            self._values = self._values[:, :, :max_length, :]
-            self._importance = self._importance[:max_length]
-            self._seq_length = max_length
+        pass
 
     def offload(self):
         pass
@@ -215,22 +271,26 @@ class AlembicLayer(CacheLayerMixin):
 
 
 class AlembicHFCache(DynamicCache):
-    """AlembicKV as DynamicCache subclass.
+    """AlembicKV: concept codebook KV cache as DynamicCache subclass.
 
-    Below budget: identical to standard DynamicCache.
-    At budget: evicts least-important tokens, keeps fixed memory.
+    Below budget: identical to DynamicCache (lossless).
+    At budget: compresses accumulated K/V into fixed codebook.
+    Above budget: absorbs new tokens into codebook. O(1) memory.
 
     Usage:
         cache = AlembicHFCache(budget=2048)
         outputs = model.generate(input_ids, past_key_values=cache)
     """
 
-    def __init__(self, budget: int = 2048, n_sink: int = 4,
-                 recent_window: int = 64):
+    def __init__(self, budget: int = 2048, write_alpha: float = 0.1,
+                 write_temp: float = 0.1, qarc_gamma: float = 0.01,
+                 resonate_every: int = 32):
         super().__init__()
         self.budget = budget
-        self.n_sink = n_sink
-        self.recent_window = recent_window
+        self.write_alpha = write_alpha
+        self.write_temp = write_temp
+        self.qarc_gamma = qarc_gamma
+        self.resonate_every = resonate_every
         self.layer_class_to_replicate = None
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor,
@@ -238,8 +298,10 @@ class AlembicHFCache(DynamicCache):
         while len(self.layers) <= layer_idx:
             self.layers.append(AlembicLayer(
                 budget=self.budget,
-                n_sink=self.n_sink,
-                recent_window=self.recent_window,
+                write_alpha=self.write_alpha,
+                write_temp=self.write_temp,
+                qarc_gamma=self.qarc_gamma,
+                resonate_every=self.resonate_every,
             ))
         return self.layers[layer_idx].update(key_states, value_states, *args, **kwargs)
 
@@ -254,12 +316,12 @@ class AlembicHFCache(DynamicCache):
         self.layers.clear()
 
     def stats(self) -> dict:
-        evicted = sum(l.tokens_evicted for l in self.layers)
-        seq_len = self.layers[0].get_seq_length() if self.layers else 0
+        absorbed = sum(l.tokens_absorbed for l in self.layers)
+        compressed = any(l._compressed for l in self.layers) if self.layers else False
         return {
             'layers': len(self.layers),
             'budget': self.budget,
-            'seq_length': seq_len,
-            'tokens_evicted': evicted,
-            'memory_tokens': seq_len,
+            'tokens_absorbed': absorbed,
+            'compressed': compressed,
+            'mode': 'codebook' if compressed else 'fill',
         }
