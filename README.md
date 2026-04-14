@@ -24,6 +24,20 @@ Measured GPU memory during actual model inference at each sequence length.
 
 At 1M tokens (extrapolated): ~55 GB standard vs ~270 MB AlembicKV = **~200x compression**.
 
+## Verified: Gemma 4 31B (google/gemma-4-31B-it, Blackwell RTX PRO 6000)
+
+Standard cache OOMs. AlembicKV keeps running.
+
+| Tokens | Standard Cache | AlembicKV (2048+512) | Result |
+|--------|---------------|----------------------|--------|
+| 1,000 | 873 MB | 863 MB | 1.0x |
+| 10,000 | 8,597 MB | 5,521 MB | **1.6x** |
+| 20,000 | 17,188 MB | 5,310 MB | **3.2x** |
+| 50,000 | **OOM** | 4,695 MB | **AlembicKV only** |
+| 100,000 | **OOM** | 5,421 MB | **AlembicKV only** |
+
+Standard KV cache exhausts 38 GB of free VRAM at ~25K tokens. AlembicKV stays flat at ~5 GB and runs to 100K+ tokens on the same hardware.
+
 ## Verified Perplexity (Qwen2.5-7B, WikiText-2)
 
 | Budget (codebook+window) | Perplexity | vs Standard |
