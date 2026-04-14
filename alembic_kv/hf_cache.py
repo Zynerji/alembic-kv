@@ -1,16 +1,23 @@
-"""HuggingFace-compatible AlembicKV cache — concept codebook KV replacement.
+"""HuggingFace-compatible AlembicKV cache — hybrid concept codebook + recent window.
 
-NOT a bounded DynamicCache. NOT eviction.
+The key insight: attention needs EXACT K/V for recent tokens but can tolerate
+compressed representations for older context. AlembicKV exploits this:
 
-This is the real AlembicKV: a fixed-size concept codebook that absorbs
-unlimited tokens via soft-attention write and returns compressed K/V
-for attention. O(1) memory. No eviction. No information loss.
+  [codebook (compressed old context)] + [recent window (exact raw tokens)]
 
-Phase 1 (fill): Store raw K/V in codebook slots (exact, like DynamicCache).
-Phase 2 (absorb): Codebook full. New tokens absorbed via soft-attention
-    into existing concepts. Codebook size never grows.
+Below budget: identical to DynamicCache (standard concat).
+At budget: compress oldest tokens into codebook, keep recent window exact.
+Above budget: absorb new old tokens into codebook, slide recent window.
 
-QARC resonance prevents codebook collapse under repeated writes.
+Memory: O(codebook_size + window_size) = O(1) regardless of total tokens.
+
+vs Eviction (StreamingLLM, H2O, SpectralKV):
+  - Eviction DISCARDS old tokens — information is lost forever
+  - AlembicKV COMPRESSES old tokens into concepts — information is retained
+
+vs Standard DynamicCache:
+  - DynamicCache stores every token — O(n) memory, explodes at long context
+  - AlembicKV caps memory at budget — O(1), fixed VRAM
 """
 
 import math
@@ -22,28 +29,37 @@ from transformers.cache_utils import DynamicCache, CacheLayerMixin
 
 
 class AlembicLayer(CacheLayerMixin):
-    """Concept codebook KV cache layer.
+    """Hybrid concept codebook + recent window KV cache layer.
 
-    Stores K/V as concepts in a fixed codebook. Below budget, stores
-    raw tokens (identical to DynamicLayer). Above budget, absorbs new
-    tokens into the codebook via soft-attention write.
+    Maintains two buffers:
+      1. Codebook (budget slots): compressed old context via soft-attention absorption
+      2. Recent window (window_size tokens): exact raw K/V, slides forward
+
+    Attention sees: [codebook | recent_window | current_token]
     """
 
-    def __init__(self, budget: int = 2048, write_alpha: float = 0.1,
-                 write_temp: float = 0.1, qarc_gamma: float = 0.01,
-                 resonate_every: int = 32):
-        self.budget = budget
+    def __init__(self, budget: int = 2048, window_size: int = 128,
+                 write_alpha: float = 0.1, write_temp: float = 0.1,
+                 qarc_gamma: float = 0.01, resonate_every: int = 64):
+        self.budget = budget           # codebook concept slots
+        self.window_size = window_size # exact recent tokens to keep
         self.write_alpha = write_alpha
         self.write_temp = write_temp
         self.qarc_gamma = qarc_gamma
         self.resonate_every = resonate_every
 
-        self._keys = None      # (B, H, T, D) — concat buffer during fill
+        # Fill phase: standard concat
+        self._keys = None      # (B, H, T, D)
         self._values = None
-        self._codebook_k = None  # (budget, H*D) — concept buffer after fill
+
+        # Codebook phase
+        self._codebook_k = None  # (budget, H*D) float32
         self._codebook_v = None
+        self._recent_k = None    # (B, H, window_size, D) raw recent tokens
+        self._recent_v = None
+
         self._is_initialized = False
-        self._compressed = False  # True once codebook is active
+        self._compressed = False
         self._seq_length = 0
         self._absorb_count = 0
         self.num_heads = 0
@@ -83,22 +99,34 @@ class AlembicLayer(CacheLayerMixin):
     def keys(self):
         if self._keys is not None:
             return self._keys
-        if self._codebook_k is not None:
-            return self._codebook_to_kv(self._codebook_k)
+        if self._compressed:
+            return self._build_full_kv()[0]
         return torch.empty(0)
 
     @property
     def values(self):
         if self._values is not None:
             return self._values
-        if self._codebook_v is not None:
-            return self._codebook_to_kv(self._codebook_v)
+        if self._compressed:
+            return self._build_full_kv()[1]
         return torch.empty(0)
 
     def _codebook_to_kv(self, codebook):
-        """Reshape codebook (budget, H*D) to KV format (1, H, budget, D)."""
+        """(budget, H*D) -> (1, H, budget, D)"""
         cb = codebook.reshape(self.budget, self.num_heads, self.head_dim)
         return cb.permute(1, 0, 2).unsqueeze(0).to(self.dtype)
+
+    def _build_full_kv(self):
+        """Build [codebook | recent] K/V tensors."""
+        B = self._recent_k.shape[0] if self._recent_k is not None else 1
+        cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
+        cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
+        if self._recent_k is not None and self._recent_k.shape[2] > 0:
+            all_k = torch.cat([cb_k, self._recent_k], dim=2)
+            all_v = torch.cat([cb_v, self._recent_v], dim=2)
+        else:
+            all_k, all_v = cb_k, cb_v
+        return all_k, all_v
 
     def lazy_initialization(self, key_states, value_states):
         B, H, T, D = key_states.shape
@@ -111,7 +139,8 @@ class AlembicLayer(CacheLayerMixin):
         if self._keys is not None:
             return self._keys.shape[2]
         if self._compressed:
-            return self.budget
+            recent_len = self._recent_k.shape[2] if self._recent_k is not None else 0
+            return self.budget + recent_len
         return 0
 
     def get_max_cache_shape(self) -> Optional[int]:
@@ -119,12 +148,11 @@ class AlembicLayer(CacheLayerMixin):
 
     def get_mask_sizes(self, query_length: int) -> Tuple[int, int]:
         if not self._compressed:
-            # Fill phase: standard concat behavior
-            kv_length = self.get_seq_length() + query_length
+            kv_length = (self._keys.shape[2] if self._keys is not None else 0) + query_length
         else:
-            # Absorb phase: codebook + raw current token
-            kv_length = self.budget + query_length
-        kv_offset = 0  # CRITICAL: must be 0 for correct causal mask
+            recent_len = self._recent_k.shape[2] if self._recent_k is not None else 0
+            kv_length = self.budget + recent_len + query_length
+        kv_offset = 0
         return kv_length, kv_offset
 
     def update(self, key_states: torch.Tensor, value_states: torch.Tensor,
@@ -136,7 +164,7 @@ class AlembicLayer(CacheLayerMixin):
         self.tokens_absorbed += T
 
         if not self._compressed:
-            # ── Phase 1: Fill (identical to DynamicLayer) ─────────
+            # ── Fill phase: standard concat ───────────────────────
             if self._keys is None:
                 self._keys = key_states
                 self._values = value_states
@@ -144,90 +172,106 @@ class AlembicLayer(CacheLayerMixin):
                 self._keys = torch.cat([self._keys, key_states], dim=2)
                 self._values = torch.cat([self._values, value_states], dim=2)
 
-            self._seq_length = self._keys.shape[2]
+            total = self._keys.shape[2]
 
-            # Transition to codebook when full
-            if self._seq_length >= self.budget:
+            # Compress when we have enough for codebook + window
+            if total >= self.budget + self.window_size:
                 self._compress()
-                # Return codebook + any overflow tokens from this batch
-                overflow = self._seq_length - self.budget
-                if overflow > 0:
-                    # The last `overflow` tokens didn't fit — absorb them
-                    overflow_k = key_states[:, :, -overflow:, :]
-                    overflow_v = value_states[:, :, -overflow:, :]
-                    self._absorb(overflow_k, overflow_v)
-                    # Return codebook + overflow raw tokens
-                    cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
-                    cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
-                    return (torch.cat([cb_k, overflow_k], dim=2),
-                            torch.cat([cb_v, overflow_v], dim=2))
-                # Exact fit — return codebook as KV
-                return (self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1),
-                        self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1))
+                # Return the full hybrid buffer
+                all_k, all_v = self._build_full_kv()
+                # Add current token if it wasn't included in recent window
+                return all_k, all_v
 
             return self._keys, self._values
 
         else:
-            # ── Phase 2: Absorb into codebook ─────────────────────
-            self._absorb(key_states, value_states)
+            # ── Hybrid phase: absorb old into codebook, slide window ──
+
+            # Current recent window tokens that are about to become "old"
+            # Push new tokens into recent window, oldest recent → codebook
+            if self._recent_k is not None and self._recent_k.shape[2] > 0:
+                # Tokens to absorb: oldest from recent window to make room
+                n_to_absorb = min(T, self._recent_k.shape[2])
+                if n_to_absorb > 0:
+                    old_k = self._recent_k[:, :, :n_to_absorb, :]
+                    old_v = self._recent_v[:, :, :n_to_absorb, :]
+                    self._absorb(old_k, old_v)
+
+                    # Slide recent window: drop oldest, append new
+                    self._recent_k = torch.cat([
+                        self._recent_k[:, :, n_to_absorb:, :],
+                        key_states
+                    ], dim=2)[:, :, -self.window_size:, :]
+                    self._recent_v = torch.cat([
+                        self._recent_v[:, :, n_to_absorb:, :],
+                        value_states
+                    ], dim=2)[:, :, -self.window_size:, :]
+            else:
+                self._recent_k = key_states
+                self._recent_v = value_states
 
             # Periodic QARC resonance
             self._absorb_count += 1
             if self._absorb_count % self.resonate_every == 0:
                 self._resonate()
 
-            # Return codebook + raw current token
-            cb_k = self._codebook_to_kv(self._codebook_k).expand(B, -1, -1, -1)
-            cb_v = self._codebook_to_kv(self._codebook_v).expand(B, -1, -1, -1)
-            all_keys = torch.cat([cb_k, key_states], dim=2)
-            all_values = torch.cat([cb_v, value_states], dim=2)
-            return all_keys, all_values
+            # Return [codebook | recent_window]
+            all_k, all_v = self._build_full_kv()
+            return all_k, all_v
 
     def _compress(self):
-        """Transition from concat buffer to concept codebook."""
+        """Split accumulated K/V into codebook (old) + recent window (new)."""
         B, H, T, D = self._keys.shape
-        # Take the last `budget` tokens as initial codebook content
-        k = self._keys[:, :, -self.budget:, :]
-        v = self._values[:, :, -self.budget:, :]
-        # Flatten: (B, H, budget, D) -> (budget, H*D) using batch 0
-        self._codebook_k = k[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
-        self._codebook_v = v[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
-        # Free concat buffers
+
+        # Recent window = last window_size tokens (exact)
+        self._recent_k = self._keys[:, :, -self.window_size:, :].clone()
+        self._recent_v = self._values[:, :, -self.window_size:, :].clone()
+
+        # Codebook = first budget tokens (compressed representation)
+        old_k = self._keys[:, :, :self.budget, :]
+        old_v = self._values[:, :, :self.budget, :]
+        self._codebook_k = old_k[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+        self._codebook_v = old_v[0].permute(1, 0, 2).reshape(self.budget, H * D).float()
+
+        # If there are tokens between budget and window, absorb them
+        middle_start = self.budget
+        middle_end = T - self.window_size
+        if middle_end > middle_start:
+            mid_k = self._keys[:, :, middle_start:middle_end, :]
+            mid_v = self._values[:, :, middle_start:middle_end, :]
+            self._absorb(mid_k, mid_v)
+
+        # Free concat buffer
         self._keys = None
         self._values = None
         self._compressed = True
 
     def _absorb(self, keys: torch.Tensor, values: torch.Tensor):
-        """Absorb new K/V into concept codebook via soft-attention write."""
+        """Absorb K/V into concept codebook via soft-attention write."""
         B, H, T, D = keys.shape
         k_flat = keys.transpose(1, 2).reshape(B * T, H * D).float()
         v_flat = values.transpose(1, 2).reshape(B * T, H * D).float()
 
-        # Normalized cosine similarity scoring
         k_norm = F.normalize(k_flat, dim=-1)
         cb_norm = F.normalize(self._codebook_k, dim=-1)
         scores = torch.matmul(k_norm, cb_norm.T) / self.write_temp
-        attn = F.softmax(scores, dim=-1)  # (B*T, budget)
+        attn = F.softmax(scores, dim=-1)
 
-        # Additive concept update
         k_update = torch.matmul(attn.T, k_flat) / max(B * T, 1)
         v_update = torch.matmul(attn.T, v_flat) / max(B * T, 1)
         self._codebook_k.add_(self.write_alpha * k_update)
         self._codebook_v.add_(self.write_alpha * v_update)
 
     def _resonate(self):
-        """QARC resonance: push correlated codebook slots apart."""
-        if self._codebook_k is None:
+        """QARC: push correlated codebook slots apart."""
+        if self._codebook_k is None or self.qarc_gamma <= 0:
             return
-        # Simple resonance: orthogonalize via gradient of pairwise similarity
         cb_norm = F.normalize(self._codebook_k, dim=-1)
-        sim = torch.matmul(cb_norm, cb_norm.T)  # (budget, budget)
-        # Zero diagonal (don't push slot away from itself)
+        sim = torch.matmul(cb_norm, cb_norm.T)
         sim.fill_diagonal_(0.0)
-        # Repulsion: each slot pushed away from its most similar neighbors
-        repulsion = torch.matmul(sim, self._codebook_k)  # (budget, kv_dim)
+        repulsion = torch.matmul(sim, self._codebook_k)
         self._codebook_k.sub_(self.qarc_gamma * repulsion)
-        # Same for values
+
         cb_norm_v = F.normalize(self._codebook_v, dim=-1)
         sim_v = torch.matmul(cb_norm_v, cb_norm_v.T)
         sim_v.fill_diagonal_(0.0)
@@ -239,6 +283,8 @@ class AlembicLayer(CacheLayerMixin):
         self._values = None
         self._codebook_k = None
         self._codebook_v = None
+        self._recent_k = None
+        self._recent_v = None
         self._is_initialized = False
         self._compressed = False
         self._seq_length = 0
@@ -249,6 +295,9 @@ class AlembicLayer(CacheLayerMixin):
         if self._keys is not None:
             self._keys = self._keys.index_select(0, beam_idx)
             self._values = self._values.index_select(0, beam_idx)
+        if self._recent_k is not None:
+            self._recent_k = self._recent_k.index_select(0, beam_idx)
+            self._recent_v = self._recent_v.index_select(0, beam_idx)
 
     def crop(self, max_length):
         pass
@@ -263,30 +312,33 @@ class AlembicLayer(CacheLayerMixin):
         if self._keys is not None:
             self._keys = self._keys.repeat_interleave(repeats, dim=0)
             self._values = self._values.repeat_interleave(repeats, dim=0)
+        if self._recent_k is not None:
+            self._recent_k = self._recent_k.repeat_interleave(repeats, dim=0)
+            self._recent_v = self._recent_v.repeat_interleave(repeats, dim=0)
 
     def batch_select_indices(self, indices):
         if self._keys is not None:
             self._keys = self._keys[indices]
             self._values = self._values[indices]
+        if self._recent_k is not None:
+            self._recent_k = self._recent_k[indices]
+            self._recent_v = self._recent_v[indices]
 
 
 class AlembicHFCache(DynamicCache):
-    """AlembicKV: concept codebook KV cache as DynamicCache subclass.
+    """AlembicKV: hybrid concept codebook + recent window.
 
-    Below budget: identical to DynamicCache (lossless).
-    At budget: compresses accumulated K/V into fixed codebook.
-    Above budget: absorbs new tokens into codebook. O(1) memory.
-
-    Usage:
-        cache = AlembicHFCache(budget=2048)
-        outputs = model.generate(input_ids, past_key_values=cache)
+    Below budget+window: identical to DynamicCache (lossless).
+    Above: old tokens compressed into codebook, recent kept exact.
+    Memory: O(budget + window_size) per layer — fixed.
     """
 
-    def __init__(self, budget: int = 2048, write_alpha: float = 0.1,
-                 write_temp: float = 0.1, qarc_gamma: float = 0.01,
-                 resonate_every: int = 32):
+    def __init__(self, budget: int = 2048, window_size: int = 128,
+                 write_alpha: float = 0.1, write_temp: float = 0.1,
+                 qarc_gamma: float = 0.01, resonate_every: int = 64):
         super().__init__()
         self.budget = budget
+        self.window_size = window_size
         self.write_alpha = write_alpha
         self.write_temp = write_temp
         self.qarc_gamma = qarc_gamma
@@ -298,6 +350,7 @@ class AlembicHFCache(DynamicCache):
         while len(self.layers) <= layer_idx:
             self.layers.append(AlembicLayer(
                 budget=self.budget,
+                window_size=self.window_size,
                 write_alpha=self.write_alpha,
                 write_temp=self.write_temp,
                 qarc_gamma=self.qarc_gamma,
@@ -321,7 +374,9 @@ class AlembicHFCache(DynamicCache):
         return {
             'layers': len(self.layers),
             'budget': self.budget,
+            'window_size': self.window_size,
             'tokens_absorbed': absorbed,
             'compressed': compressed,
-            'mode': 'codebook' if compressed else 'fill',
+            'mode': 'codebook+window' if compressed else 'fill',
+            'memory_slots': self.budget + self.window_size if compressed else 'growing',
         }
